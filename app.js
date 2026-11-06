@@ -579,3 +579,15 @@ if (navigator.geolocation) {
     { timeout: 5000 }
   );
 }
+
+// ---------- PWA: register the service worker (offline app shell) ----------
+// Skips file:// and non-localhost http, where SW registration is unsupported.
+if ("serviceWorker" in navigator &&
+    (location.protocol === "https:" ||
+     ["localhost", "127.0.0.1", "0.0.0.0"].includes(location.hostname))) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("sw.js").catch(() => {
+      /* SW unavailable — the app works without it (online only) */
+    });
+  });
+}
