@@ -1,0 +1,18 @@
+{
+  "name": "Skycast — Weather Search",
+  "short_name": "Skycast",
+  "description": "Search any city, see current conditions and a 7-day forecast. Powered by Open-Meteo — no API key needed.",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#2f6fb5",
+  "theme_color": "#2f6fb5",
+  "lang": "en",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
