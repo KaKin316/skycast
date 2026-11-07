@@ -218,12 +218,139 @@ function fmtWind(value, unit = "km/h") {
 
 // ---------- Search / geocoding ----------
 
-async function searchLocations(query) {
-  const url = `${GEOCODE_ENDPOINT}?name=${encodeURIComponent(query)}&count=6&language=en&format=json`;
+// UI language -> Open-Meteo geocoding `language` code.
+// Verified: all 8 are supported, and results (name, admin1, country) come
+// back localized in that language (e.g. Paris -> 巴黎 / パリ / 파리).
+const GEOCODE_LANG = {
+  en: "en", "zh-TW": "zh-TW", "zh-CN": "zh", ja: "ja", ko: "ko", es: "es", fr: "fr", de: "de",
+};
+
+// The geocoding API picks the pool of name variants from `language` and
+// matches CJK/Hangul queries by exact name (e.g. the zh-TW pool has 臺北市
+// but not 台北; the en pool has "Taipei" but no CJK). Coverage differs per
+// city (巴黎 exists in the zh pool but not zh-TW; 東京 in ja is 東京都), so
+// when a query returns nothing we retry across pools and spelling variants.
+const CJK_RE = /[\u2E80-\u9FFF\u3040-\u30FF\uAC00-\uD7AF]/;
+const CJK_POOLS = ["zh", "zh-TW", "ja", "ko"];
+
+// Curated aliases for CJK "shadow" names, where the pools make the bare name
+// resolve to the wrong (minor) place while the major city is stored under a
+// suffixed or re-spelled name. Verified against the API:
+//   纽约/紐約  -> only tiny 纽约s exist (Kentucky…); NYC is 紐約市 (zh/zh-TW pools)
+//   伦敦       -> the zh pool has only Canada/USA; UK London is 倫敦 (zh-TW pool)
+// Tried alongside the query in round 1; an alias hit beats the bare hit.
+// Add more here when a new shadow case is found.
+const CJK_ALIASES = {
+  纽约: ["紐約市"], 紐約: ["紐約市"], // NYC is stored as 紐約市 (bare 纽约 = tiny towns)
+  东京: ["東京"], // the zh pool's 东京 are Jiangsu/Zhejiang villages; Tokyo is 東京
+  伦敦: ["倫敦"], // the zh pool's 伦敦 are Canada/USA only; UK London is 倫敦
+  台北: ["臺北市", "台北市"], // the pools store Taipei with the 市 suffix
+  首尔: ["首爾"], // the zh-TW pool spells Seoul 首爾
+};
+
+// Common simplified<->traditional pairs that occur in place names (major world
+// cities included: 纽约, 旧金山, 伦敦, 洛杉矶, 多伦多, 温哥华, 里约, 圣保罗, 开罗…).
+// Used only to build fallback *queries* — display always uses the API's own names.
+const S2T = {
+  台: "臺", 东: "東", 国: "國", 华: "華", 门: "門", 马: "馬", 龙: "龍", 凤: "鳳",
+  汉: "漢", 刘: "劉", 陈: "陳", 杨: "楊", 黄: "黃", 张: "張", 郑: "鄭", 卫: "衛",
+  陆: "陸", 苏: "蘇", 辽: "遼", 宁: "寧", 长: "長", 庆: "慶", 岛: "島", 阳: "陽",
+  滨: "濱", 尔: "爾", 广: "廣", 湾: "灣", 县: "縣", 区: "區", 镇: "鎮", 乡: "鄉",
+  庄: "莊", 园: "園", 庙: "廟", 观: "觀", 宫: "宮", 楼: "樓", 阁: "閣", 场: "場",
+  热: "熱", 风: "風", 温: "溫", 岭: "嶺", 屿: "嶼", 峡: "峽", 闽: "閩", 粤: "粵",
+  鲁: "魯", 赣: "贛", 琼: "瓊", 陕: "陝", 贵: "貴", 云: "雲", 纽: "紐",
+  约: "約", 旧: "舊", 维: "維", 顿: "頓", 图: "圖", 伦: "倫", 奥: "奧",
+  兰: "蘭", 罗: "羅", 圣: "聖", 卢: "盧", 关: "關", 开: "開", 连: "連",
+  厦: "廈", 无: "無", 济: "濟", 银: "銀", 乌: "烏", 萨: "薩", 亚: "亞",
+  矶: "磯", 彻: "徹",
+};
+const T2S = Object.fromEntries(Object.entries(S2T).map(([k, v]) => [v, k]));
+
+function cjkMap(str, map) {
+  let out = "";
+  for (const ch of str) out += Object.prototype.hasOwnProperty.call(map, ch) ? map[ch] : ch;
+  return out;
+}
+
+async function geocodeOnce(language, name) {
+  const url = `${GEOCODE_ENDPOINT}?name=${encodeURIComponent(name)}&count=6&language=${language}&format=json`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Geocoding failed (${res.status})`);
   const data = await res.json();
   return data.results || [];
+}
+
+async function searchLocations(query) {
+  const pool = GEOCODE_LANG[state.lang] || "en";
+  const isCJK = CJK_RE.test(query);
+
+  // CJK input can only ever match CJK pools (exact match required); Latin
+  // input matches the selected pool plus the (most complete) English pool.
+  const pools = isCJK
+    ? [...new Set([...(CJK_POOLS.includes(pool) ? [pool] : []), ...CJK_POOLS])]
+    : [...new Set([pool, "en"])];
+
+  // Round 1 — the query as typed, against every relevant pool IN PARALLEL
+  // (one round-trip, so the common case is never slower than before), plus
+  // the curated alias queries for known shadow names.
+  const aliasNames = isCJK ? [...new Set([...(CJK_ALIASES[query] || []), query])] : [query];
+  const round1 = pools.flatMap((p) => aliasNames.map((q) => [p, q]));
+  const results1 = await Promise.all(
+    round1.map(([p, q]) => geocodeOnce(p, q).catch(() => []))
+  );
+  // Among hitting queries: a curated alias wins (it points at the major
+  // city), then the most specific (longest) query; ties keep pool order.
+  let found = [];
+  let bestKey = -1;
+  results1.forEach((r, i) => {
+    if (!r.length) return;
+    const q = round1[i][1];
+    const key = (q !== query ? 1000 : 0) + q.length;
+    if (key > bestKey) {
+      bestKey = key;
+      found = r;
+    }
+  });
+
+  if (!found.length && isCJK) {
+    // Round 2 — CJK pools are exact-match with per-city quirks
+    // (台北 -> 臺北市, 東京 -> 東京都, 서울 -> 서울특별시, 巴黎 missing
+    // from the zh-TW pool but present in zh). Re-spell simplified<->
+    // traditional and try administrative suffixes, in parallel, capped.
+    const respell = [...new Set([query, cjkMap(query, S2T), cjkMap(query, T2S)])];
+    // Hangul vs kanji get different administrative-suffix ladders, most
+    // promising first (서울 -> 서울특별시, 台北 -> 臺北市/台北市, 東京 -> 東京都).
+    const hangul = /[\uAC00-\uD7AF]/.test(query);
+    const SUFFIXES = hangul ? ["특별시", "시", "도", "省"] : ["市", "都", "省", "県", "县"];
+    const variants = [...new Set([
+      ...respell.filter((v) => v !== query),
+      ...respell.flatMap((q) => SUFFIXES.map((s) => q + s)),
+    ])];
+    // Pool-major (the selected pool is first in `pools`): the user's language
+    // tries every spelling variant before other pools, so the cap covers the
+    // selected pool fully plus the next pools — needed because the right pool
+    // for a city varies (首尔 only in zh-TW, 紐約市 in zh/zh-TW).
+    const attempts = pools.flatMap((p) => variants.map((v) => [p, v])).slice(0, 24);
+    const results = await Promise.all(
+      attempts.map(([p, v]) => geocodeOnce(p, v).catch(() => []))
+    );
+    // A bare re-spelling can hit a tiny place that shadows the big one
+    // (纽约 -> 紐約 in Kentucky, while 紐約市 is New York City), so among the
+    // hitting attempts prefer the most specific (longest) query; ties keep
+    // pool/variant order. One failing leg degrades to "no results" instead
+    // of sinking the whole round.
+    let best = -1;
+    let bestLen = -1;
+    results.forEach((r, i) => {
+      if (r.length && attempts[i][1].length > bestLen) {
+        best = i;
+        bestLen = attempts[i][1].length;
+      }
+    });
+    found = best >= 0 ? results[best] : [];
+  }
+
+  return found || [];
 }
 
 async function loadWeather(location) {
